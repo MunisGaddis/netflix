@@ -1,0 +1,136 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'jdk17'
+        nodejs 'node16'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        NVD_API_KEY = credentials('nvd-api-key')
+        TMDB_API_KEY = credentials('tmdb-api-key')
+    }
+
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout from Git') {
+            steps {
+                git branch: 'main', url: 'https://github.com/Aj7Ay/Netflix-clone.git'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh '''$SCANNER_HOME/bin/sonar-scanner \
+                          -Dsonar.projectName=Netflix \
+                          -Dsonar.projectKey=Netflix \
+                          -Dsonar.sources=.'''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh "npm install"
+                sh "npm audit fix || true"
+            }
+        }
+
+        stage('OWASP Dependency Check') {
+            steps {
+                script {
+                    try {
+                        dependencyCheck additionalArguments: "--scan ./ --disableYarnAudit --disableNodeAudit --nvdApiKey=${NVD_API_KEY}", odcInstallation: 'DP-Check'
+                    } catch (Exception e) {
+                        echo "⚠ OWASP Dependency Check failed: ${e}"
+                        echo "Retrying with local cache..."
+                        dependencyCheck additionalArguments: "--scan ./ --disableYarnAudit --disableNodeAudit", odcInstallation: 'DP-Check'
+                    }
+                }
+            }
+        }
+
+        stage('Trivy FS Scan') {
+            steps {
+                sh '''
+                   if ! command -v trivy >/dev/null; then
+                       echo 'Installing Trivy...'
+                       wget -q https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.56.2_Linux-64bit.deb
+                       sudo dpkg -i trivy_0.56.2_Linux-64bit.deb
+                   fi
+                   trivy fs --format json -o trivyfs.json .
+                '''
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker-creds', toolName: 'docker') {
+                        sh """
+                           docker build --build-arg TMDB_V3_API_KEY=${TMDB_API_KEY} \
+                           -t monudocker334/netflix:latest .
+                           docker push monudocker334/netflix:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh "trivy image --format json -o trivyimage.json monudocker334/netflix:latest"
+            }
+        }
+
+        stage('Deploy to Container (5 min)') {
+            steps {
+                sh '''
+                   docker rm -f netflix-app || true
+                   docker run -d --name netflix-app -p 8081:80 monudocker334/netflix:latest
+                   echo "Container started. Keeping it alive for 5 minutes..."
+                   sleep 300
+                   echo "Stopping and removing container..."
+                   docker rm -f netflix-app || true
+                   docker rmi -f monudocker334/netflix:latest || true
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            // Cleanup
+            sh '''
+               docker rm -f netflix-app || true
+               docker rmi -f monudocker334/netflix:latest || true
+            '''
+            archiveArtifacts artifacts: '**/*.json', allowEmptyArchive: true
+            echo "✅ Pipeline completed. Artifacts archived and Docker cleanup done."
+
+            // Email Notification
+            emailext attachLog: true,
+                subject: "'${currentBuild.result}'",
+                body: "Project: ${env.JOB_NAME}<br/>" +
+                      "Build Number: ${env.BUILD_NUMBER}<br/>" +
+                      "URL: ${env.BUILD_URL}<br/>",
+                to: 'munishkapoorin@gmail.com',
+                attachmentsPattern: 'trivyfs.json,trivyimage.json'
+        }
+    }
+}
