@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: netflix-deployment
 spec:
-  replicas: 0 # Number of desired replicas
+  replicas: 5 # Number of desired replicas
   selector:
     matchLabels:
       app: netflix
