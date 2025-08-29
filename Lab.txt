@@ -1,0 +1,2 @@
+kubectl port-forward svc/netflix-service 3001:80
+access localhost:3001
